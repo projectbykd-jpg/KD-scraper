@@ -30,10 +30,9 @@ async function api(action, body) {
 			const t = await r.text();
 			if (!r.ok) {
 				const err = new Error(`callback ${action} HTTP ${r.status}: ${t.slice(0, 180)}`);
-				if (!retryableHttpStatus(r.status) || attempt === 4) throw err;
-				lastErr = err;
-				await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
-				continue;
+				// Status yang tidak akan berubah kalau diulang (400/401/404, dst) langsung gagal.
+				if (!retryableHttpStatus(r.status)) err.fatal = true;
+				throw err;
 			}
 			let j;
 			try {
@@ -41,11 +40,16 @@ async function api(action, body) {
 			} catch {
 				throw new Error(`callback ${action} bukan JSON: ${t.slice(0, 200)}`);
 			}
-			if (j && j.success === false) throw new Error(j.message || `callback ${action} gagal`);
+			if (j && j.success === false) {
+				// Penolakan dari panel (key salah, job sudah ditutup, dst) bersifat tetap.
+				const err = new Error(j.message || `callback ${action} gagal`);
+				err.fatal = true;
+				throw err;
+			}
 			return j;
 		} catch (e) {
 			lastErr = e;
-			if (attempt === 4) throw e;
+			if ((e && e.fatal) || attempt === 4) throw e;
 			await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
 		}
 	}
@@ -71,14 +75,23 @@ async function getText(url, headers, { attempts = 4, timeoutMs = 25000 } = {}) {
 			const r = await fetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
 			const text = await r.text();
 			if (r.ok) return text;
+			// Sesi admin habis -> server mengalihkan ke halaman login. Pesan ini yang
+			// dibaca operator di panel, jadi jelaskan penyebabnya (bukan "HTTP 302 + URL panjang").
+			if (r.status === 401 || r.status === 403 || (r.status >= 300 && r.status < 400)) {
+				const expired = new Error(`Cookie Admin kedaluwarsa / ditolak (HTTP ${r.status}). Perbarui cookie di Laporan Harian → Setting.`);
+				expired.fatal = true;
+				throw expired;
+			}
 			const err = new Error(`target HTTP ${r.status} untuk ${url}`);
 			// Jangan menganggap 401/403/redirect sebagai halaman kosong; itu akan
 			// membuat hasil terlihat sukses padahal data terpotong.
-			if (!retryableHttpStatus(r.status) || attempt === attempts) throw err;
-			lastErr = err;
+			// Status yang tidak retryable langsung gagal (dulu throw di dalam try ini
+			// ikut ditangkap catch di bawah dan tetap diulang `attempts` kali).
+			if (!retryableHttpStatus(r.status)) err.fatal = true;
+			throw err;
 		} catch (e) {
 			lastErr = e;
-			if (attempt === attempts) throw e;
+			if ((e && e.fatal) || attempt === attempts) throw e;
 		}
 		await new Promise((resolve) => setTimeout(resolve, Math.min(8000, attempt * 1000)));
 	}
