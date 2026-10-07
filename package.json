@@ -4,6 +4,7 @@
   "type": "module",
   "description": "Scraper Laporan Harian Day-Group Panel (GitHub Actions). Playwright dipasang on-demand di workflow untuk job Mozart.",
   "scripts": {
-    "start": "node scrape.mjs"
+    "start": "node scrape.mjs",
+    "test": "node --test test/parse.test.mjs"
   }
 }
