@@ -266,6 +266,34 @@ function parseAgentOperatorRows(html, operatorName) {
 	}
 	return results;
 }
+// Tabel "History Operator" (agen_operator.php?action=4): per operator DEPOSIT /
+// WITHDRAW / REJECT + baris Total. Dipakai panel untuk total harian & pemisahan
+// operator khusus (mis. Blazz / Khanpay) -- diatur di menu Admin panel.
+function parseOperatorSummary(html) {
+	const rows = [];
+	let total = null;
+	const trs = String(html || "").match(/<tr\b[^>]*>[\s\S]*?<\/tr>/gi) || [];
+	for (const rowHtml of trs) {
+		if (/<th\b/i.test(rowHtml)) continue;
+		const cells = [];
+		const re = /<td\b[^>]*>([\s\S]*?)<\/td>/gi;
+		let m;
+		while ((m = re.exec(rowHtml)) !== null) cells.push(cleanHtmlText(m[1]));
+		if (!cells.length) continue;
+		if (/^\d+$/.test(cells[0]) && cells.length >= 5 && cells[1]) {
+			rows.push({
+				operator: cells[1],
+				deposit: parseMoneyValue(cells[2]) || 0,
+				withdraw: parseMoneyValue(cells[3]) || 0,
+				reject: parseMoneyValue(cells[4]) || 0,
+			});
+		} else if (/^total$/i.test(cells[0]) && !total) {
+			const nums = cells.slice(1).map(parseMoneyValue).filter((v) => v !== null);
+			if (nums.length >= 2) total = { deposit: nums[0], withdraw: nums[1], reject: nums[2] || 0 };
+		}
+	}
+	return { rows, total };
+}
 function parseCoinHtmlRows(html, filterKata) {
 	const list = [];
 	const rows = html.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi);
@@ -413,7 +441,8 @@ async function scrapeReportAgent(baseUrl, headers, startDate, endDate) {
 	const mainRes = await getText(`${baseUrl}/agen_operator.php?action=4&date1=${d1}&date2=${d2}`, headers);
 	const rawOps = mainRes.match(/by=([^&"'>\s]+)/g) || [];
 	const operators = [...new Set(rawOps.map((o) => o.split("=")[1]))].filter(Boolean);
-	if (!operators.length) return { reportAgentData: [], operatorList: [] };
+	const operatorSummary = parseOperatorSummary(mainRes);
+	if (!operators.length) return { reportAgentData: [], operatorList: [], operatorSummary };
 
 	const statusGroups = ["valstatus=1&valstatus2=3&valstatus3=7&valstatus4=6", "valstatus=2&valstatus2=4"];
 	const first = [];
@@ -452,7 +481,7 @@ async function scrapeReportAgent(baseUrl, headers, startDate, endDate) {
 		seen.add(k);
 		return true;
 	});
-	return { reportAgentData: allData, operatorList: operators };
+	return { reportAgentData: allData, operatorList: operators, operatorSummary };
 }
 
 // ---------------------------------------------------------------------------
@@ -822,7 +851,7 @@ async function mozartCollect(fetchAll, startDate, endDate) {
 	try {
 		const ra = await scrapeReportAgent(baseUrl, headers, startDate, endDate);
 		data.reportAgent = ra.reportAgentData;
-		data.reportAgentMeta = [{ operatorList: ra.operatorList }];
+		data.reportAgentMeta = [{ operatorList: ra.operatorList, summary: ra.operatorSummary }];
 		console.log(`reportAgent: ${ra.reportAgentData.length} baris`);
 	} catch (e) {
 		errors.reportAgent = e.message;
