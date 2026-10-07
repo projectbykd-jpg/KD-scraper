@@ -37,9 +37,11 @@ jobs:
           npm i playwright@1.47.2 playwright-extra@4.3.6 puppeteer-extra-plugin-stealth@2.11.2 --no-save
           npx playwright install --with-deps chromium
 
-      # Jangan biarkan token callback muncul sebagai teks biasa di log.
+      # Jangan biarkan token callback muncul sebagai teks biasa di log (lewat env, bukan interpolasi ke skrip shell).
       - name: Mask callback key
-        run: echo "::add-mask::${{ github.event.inputs.key }}"
+        env:
+          KEY: ${{ github.event.inputs.key }}
+        run: echo "::add-mask::$KEY"
 
       - name: Run scraper (retry transient failure)
         env:
@@ -52,15 +54,37 @@ jobs:
           last_status=1
           for attempt in 1 2 3; do
             echo "=== Scraper attempt ${attempt}/3 ==="
+            # `if ...; then ...; else last_status=$?; fi` -- status kegagalan diambil DI cabang else
+            # (dulu `last_status=$?` setelah `fi` selalu 0, sehingga run tetap hijau walau gagal 3x).
             if node scrape.mjs; then
               echo "=== Scraper sukses pada attempt ${attempt} ==="
               exit 0
+            else
+              last_status=$?
             fi
-            last_status=$?
             echo "=== Scraper gagal pada attempt ${attempt} (exit ${last_status}) ==="
+            # exit 2 = kegagalan permanen (cookie kedaluwarsa, batas waktu internal): jangan diulang.
+            if [ "${last_status}" -eq 2 ]; then
+              echo "=== Kegagalan permanen, tidak diulang ==="
+              break
+            fi
             if [ "${attempt}" -lt 3 ]; then
               sleep $((attempt * 8))
             fi
           done
-          echo "=== Scraper gagal setelah 3 attempt ==="
+          echo "=== Scraper gagal ==="
           exit "${last_status}"
+
+      # Jaring pengaman: bila langkah di atas mati tanpa sempat lapor (npm/playwright gagal, runner dibatalkan,
+      # waktu habis), tutup job di panel sebagai GAGAL supaya tidak menggantung "running" dan menahan antrean user lain.
+      # Bila job sudah ditutup scraper, panel menolak dengan aman (keluaran diabaikan).
+      - name: Laporkan gagal ke panel bila job tidak sempat lapor
+        if: ${{ failure() || cancelled() }}
+        env:
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          CALLBACK: ${{ github.event.inputs.callback }}
+          KEY: ${{ github.event.inputs.key }}
+        run: |
+          curl -sS -m 30 -X POST "${CALLBACK}/api" -H "content-type: application/json" \
+            --data "$(printf '{"action":"lapJobResult","jobId":"%s","key":"%s","ok":false,"data":{},"errors":{"runner":"Job dihentikan sebelum selesai (runner gagal/dibatalkan/waktu habis). Coba tarik data lagi."}}' "${JOB_ID}" "${KEY}")" \
+            >/dev/null 2>&1 || true

@@ -184,8 +184,16 @@ function cleanHtmlText(html) {
 function parseMoneyValue(value) {
 	const text = String(value || "").trim();
 	if (!text || !/\d/.test(text)) return null;
-	const cleaned = text.replace(/[^\d.\-]/g, "");
+	let cleaned = text.replace(/[^\d.,\-]/g, "");
 	if (!cleaned) return null;
+	// Format Indonesia: titik = ribuan, koma = desimal ("1.250.000", "1.234.567,50", "1.250,50").
+	// Hanya dipakai bila TIDAK ambigu (>=2 grup titik, atau 1 grup titik + koma desimal); selain itu perilaku lama
+	// (koma = ribuan: "1,250,000.50"; "1.25" tetap desimal) supaya angka yang sudah benar tidak berubah.
+	if (/^-?\d{1,3}(\.\d{3}){2,}(,\d+)?$/.test(cleaned) || /^-?\d{1,3}(\.\d{3})+,\d{1,2}$/.test(cleaned)) {
+		cleaned = cleaned.replace(/\./g, "").replace(",", ".");
+	} else {
+		cleaned = cleaned.replace(/,/g, "");
+	}
 	const n = parseFloat(cleaned);
 	return Number.isFinite(n) ? n : null;
 }
@@ -274,12 +282,14 @@ function parseOperatorSummary(html) {
 	let total = null;
 	const trs = String(html || "").match(/<tr\b[^>]*>[\s\S]*?<\/tr>/gi) || [];
 	for (const rowHtml of trs) {
-		if (/<th\b/i.test(rowHtml)) continue;
 		const cells = [];
-		const re = /<td\b[^>]*>([\s\S]*?)<\/td>/gi;
+		const re = /<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi;
 		let m;
 		while ((m = re.exec(rowHtml)) !== null) cells.push(cleanHtmlText(m[1]));
 		if (!cells.length) continue;
+		// Baris judul kolom (semua <th>) dilewati, KECUALI baris "Total" yang kadang ditulis dengan <th>.
+		const isTotal = /^total\b/i.test(cells[0].replace(/[:\s]+$/, ""));
+		if (!/<td\b/i.test(rowHtml) && !isTotal) continue;
 		if (/^\d+$/.test(cells[0]) && cells.length >= 5 && cells[1]) {
 			rows.push({
 				operator: cells[1],
@@ -287,11 +297,13 @@ function parseOperatorSummary(html) {
 				withdraw: parseMoneyValue(cells[3]) || 0,
 				reject: parseMoneyValue(cells[4]) || 0,
 			});
-		} else if (/^total$/i.test(cells[0]) && !total) {
-			const nums = cells.slice(1).map(parseMoneyValue).filter((v) => v !== null);
-			if (nums.length >= 2) total = { deposit: nums[0], withdraw: nums[1], reject: nums[2] || 0 };
+		} else if (isTotal && !total) {
+			// Total berposisi kolom sama dengan baris operator bila sel lengkap (sel kosong tidak menggeser kolom).
+			const nums = cells.length >= 5 ? [cells[2], cells[3], cells[4]].map(parseMoneyValue) : cells.slice(1).map(parseMoneyValue).filter((v) => v !== null);
+			if (nums.length >= 2 && nums[0] !== null && nums[1] !== null) total = { deposit: nums[0], withdraw: nums[1], reject: nums[2] || 0 };
 		}
 	}
+	if (!rows.length && trs.length > 3) console.warn(`parseOperatorSummary: ${trs.length} baris tabel tetapi 0 operator ter-parse (format halaman berubah?)`);
 	return { rows, total };
 }
 function parseCoinHtmlRows(html, filterKata) {
@@ -440,7 +452,15 @@ async function scrapeReportAgent(baseUrl, headers, startDate, endDate) {
 
 	const mainRes = await getText(`${baseUrl}/agen_operator.php?action=4&date1=${d1}&date2=${d2}`, headers);
 	const rawOps = mainRes.match(/by=([^&"'>\s]+)/g) || [];
-	const operators = [...new Set(rawOps.map((o) => o.split("=")[1]))].filter(Boolean);
+	// Nama di tautan bisa sudah di-encode ("John%20Doe"): decode dulu, karena URL dibangun ulang dengan encodeURIComponent.
+	const safeDecode = (t) => {
+		try {
+			return decodeURIComponent(String(t).replace(/\+/g, " "));
+		} catch {
+			return String(t);
+		}
+	};
+	const operators = [...new Set(rawOps.map((o) => safeDecode(o.split("=")[1])))].filter(Boolean);
 	const operatorSummary = parseOperatorSummary(mainRes);
 	if (!operators.length) return { reportAgentData: [], operatorList: [], operatorSummary };
 
@@ -694,24 +714,37 @@ async function scrapeMozart(base, cookie, startDate, endDate) {
 		await warmUp(ref);
 		const PAGE = 100;
 		const rows = [];
+		// Satu percobaan: fetch di dalam browser DENGAN timeout (tanpa ini Cloudflare yang menahan koneksi membuat
+		// job menggantung sampai dibunuh runner), plus batas waktu sisi Node.
+		const once = (pg) =>
+			Promise.race([
+				page.evaluate(
+					async ({ url, payload }) => {
+						try {
+							const r = await fetch(url, {
+								method: "POST",
+								headers: { "content-type": "application/json", accept: "application/json, text/plain, */*" },
+								body: JSON.stringify(payload),
+								credentials: "include",
+								signal: AbortSignal.timeout(30000),
+							});
+							const t = await r.text();
+							return { status: r.status, text: t };
+						} catch (e) {
+							return { status: 0, text: String(e && e.message) };
+						}
+					},
+					{ url: base + path, payload: { ...body, page_number: pg, page_size: PAGE } },
+				),
+				new Promise((resolve) => setTimeout(() => resolve({ status: 0, text: "timeout 45 dtk" }), 45000)),
+			]);
 		for (let pg = 0; pg < 100; pg++) {
-			const res = await page.evaluate(
-				async ({ url, payload }) => {
-					try {
-						const r = await fetch(url, {
-							method: "POST",
-							headers: { "content-type": "application/json", accept: "application/json, text/plain, */*" },
-							body: JSON.stringify(payload),
-							credentials: "include",
-						});
-						const t = await r.text();
-						return { status: r.status, text: t };
-					} catch (e) {
-						return { status: 0, text: String(e && e.message) };
-					}
-				},
-				{ url: base + path, payload: { ...body, page_number: pg, page_size: PAGE } },
-			);
+			let res = await once(pg);
+			// Gangguan sementara di TENGAH data (429/5xx/jaringan/bukan-JSON) diulang; jangan dianggap akhir data.
+			for (let attempt = 2; attempt <= 3 && pg > 0 && (res.status === 0 || res.status === 429 || res.status >= 500 || !/^\s*[\[{]/.test(String(res.text))); attempt++) {
+				await new Promise((r) => setTimeout(r, attempt * 2000));
+				res = await once(pg);
+			}
 			if (res.status === 401) throw new Error("MOZART 401: cookie/atoken ditolak / kedaluwarsa. Perbarui di Setting.");
 			if (res.status === 403 || res.status === 503) {
 				const title = await page.title().catch(() => "");
@@ -720,6 +753,8 @@ async function scrapeMozart(base, cookie, startDate, endDate) {
 			}
 			if (res.status >= 400 || res.status === 0) {
 				if (pg === 0) throw new Error("MOZART error " + res.status + ": " + String(res.text).slice(0, 120));
+				// status 0 / 429 / 5xx yang tetap gagal setelah diulang = data TERPOTONG: jangan lapor sukses.
+				if (res.status === 0 || res.status === 429 || res.status >= 500) throw new Error(`MOZART gagal di halaman ${pg + 1} (${res.status}) setelah diulang; data tidak lengkap.`);
 				break;
 			}
 			let j;
@@ -727,7 +762,7 @@ async function scrapeMozart(base, cookie, startDate, endDate) {
 				j = JSON.parse(res.text);
 			} catch {
 				if (pg === 0) throw new Error("Respons Mozart bukan JSON: " + String(res.text).slice(0, 120));
-				break;
+				throw new Error(`Respons Mozart halaman ${pg + 1} bukan JSON setelah diulang; data tidak lengkap.`);
 			}
 			const f = mozFindRows(j);
 			rows.push(...f);
@@ -797,6 +832,20 @@ async function mozartCollect(fetchAll, startDate, endDate) {
 // ---------------------------------------------------------------------------
 // MAIN
 // ---------------------------------------------------------------------------
+// Batas waktu internal: bila proses menggantung (mis. Cloudflare menahan koneksi) laporkan GAGAL ke panel dan keluar (22 mnt < batas runner 25 mnt),
+// jangan menunggu runner membunuh job (25 menit) -- selama itu antrean user lain ikut tertahan.
+const DEADLINE_MS = 22 * 60 * 1000;
+const deadline = setTimeout(async () => {
+	console.error("Batas waktu internal tercapai; melaporkan gagal ke panel.");
+	try {
+		await api("lapJobResult", { ok: false, data: {}, errors: { timeout: "Scraper melebihi batas waktu 22 menit (sumber lambat/menahan koneksi). Coba lagi nanti." } });
+	} catch {
+		/* panel menolak / sudah ditutup: abaikan */
+	}
+	process.exit(2);
+}, DEADLINE_MS);
+deadline.unref();
+
 (async () => {
 	if (!JOB_ID || !CALLBACK || !KEY) {
 		console.error("env JOB_ID/CALLBACK/KEY wajib");
@@ -815,15 +864,22 @@ async function mozartCollect(fetchAll, startDate, endDate) {
 	if (kind === "mozart") {
 		let mbase = String(creds.linkMozart || "").trim();
 		if (!/^https?:\/\//i.test(mbase)) mbase = "https://" + mbase;
+		let data;
 		try {
-			const data = await scrapeMozart(mbase, String(creds.cookieMozart || "").trim(), params.startDate, params.endDate);
-			await api("lapJobResult", { ok: true, data, errors: {} });
-			console.log("MOZART SELESAI:", data.mozartDepo.length, "dp,", data.mozartWd.length, "wd");
+			data = await scrapeMozart(mbase, String(creds.cookieMozart || "").trim(), params.startDate, params.endDate);
 		} catch (e) {
-			await api("lapJobResult", { ok: false, data: {}, errors: { mozart: e.message } });
+			// Gagal MENGAMBIL data. Kegagalan melapor tidak boleh menimpa pesan asli / membuat unhandled rejection.
+			try {
+				await api("lapJobResult", { ok: false, data: {}, errors: { mozart: e.message } });
+			} catch (e2) {
+				console.error("lapor gagal:", e2.message);
+			}
 			console.error("mozart:", e.message);
-			process.exit(1);
+			process.exit(e && e.fatal ? 2 : 1);
 		}
+		// Pengiriman hasil dipisah dari pengambilan: bila callback gagal, JANGAN mengirim ok:false untuk job yang mungkin sudah tersimpan.
+		await api("lapJobResult", { ok: true, data, errors: {} });
+		console.log("MOZART SELESAI:", data.mozartDepo.length, "dp,", data.mozartWd.length, "wd");
 		return;
 	}
 
@@ -881,5 +937,6 @@ async function mozartCollect(fetchAll, startDate, endDate) {
 	const ok = Object.keys(data).filter((k) => Array.isArray(data[k]) && k !== "registerMeta").length > 0;
 	await api("lapJobResult", { ok, data, errors });
 	console.log(ok ? "SELESAI" : "GAGAL total");
-	if (!ok) process.exit(1);
+	// Kode 2 = kegagalan permanen (cookie kedaluwarsa dsb): workflow tidak mengulang.
+	if (!ok) process.exit(Object.values(errors).some((m) => /kedaluwarsa|expired|ditolak/i.test(String(m))) ? 2 : 1);
 })();
