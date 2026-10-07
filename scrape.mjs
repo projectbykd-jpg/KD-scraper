@@ -298,9 +298,19 @@ function parseOperatorSummary(html) {
 				reject: parseMoneyValue(cells[4]) || 0,
 			});
 		} else if (isTotal && !total) {
-			// Total berposisi kolom sama dengan baris operator bila sel lengkap (sel kosong tidak menggeser kolom).
-			const nums = cells.length >= 5 ? [cells[2], cells[3], cells[4]].map(parseMoneyValue) : cells.slice(1).map(parseMoneyValue).filter((v) => v !== null);
+			// Posisi kolom baris Total BERBEDA-BEDA: sel "Total" bisa menggabung kolom No+Operator (colspan) -> angka mulai di sel ke-2,
+			// atau sel kosong menggantikan kolom Operator -> angka mulai di sel ke-3. Sel ke-2 berisi angka = tanpa kolom kosong.
+			const start = cells.length >= 5 && !cells[1] ? 2 : 1;
+			const nums = cells.slice(start, start + 3).map(parseMoneyValue);
 			if (nums.length >= 2 && nums[0] !== null && nums[1] !== null) total = { deposit: nums[0], withdraw: nums[1], reject: nums[2] || 0 };
+		}
+	}
+	// Jumlah dari baris operator tidak ambigu; baris Total hanya dipercaya bila cocok dengan jumlah itu (kolom bisa bergeser/ada kolom ekstra).
+	if (rows.length) {
+		const sum = rows.reduce((a, r) => ({ deposit: a.deposit + r.deposit, withdraw: a.withdraw + r.withdraw, reject: a.reject + r.reject }), { deposit: 0, withdraw: 0, reject: 0 });
+		if (!total || total.deposit !== sum.deposit || total.withdraw !== sum.withdraw || total.reject !== sum.reject) {
+			if (total) console.warn(`parseOperatorSummary: baris Total tidak cocok dengan jumlah operator, memakai jumlah operator (${JSON.stringify(total)} vs ${JSON.stringify(sum)})`);
+			total = sum;
 		}
 	}
 	if (!rows.length && trs.length > 3) console.warn(`parseOperatorSummary: ${trs.length} baris tabel tetapi 0 operator ter-parse (format halaman berubah?)`);
