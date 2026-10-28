@@ -5,9 +5,18 @@
 // Alur: ambil kredensial + tanggal dari panel-worker (token sekali-pakai) ->
 // scrape -> kirim hasil balik ke panel-worker -> disimpan ke D1.
 
+import { execFile } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 const JOB_ID = process.env.JOB_ID;
 const CALLBACK = String(process.env.CALLBACK || "").replace(/\/+$/, "");
 const KEY = process.env.KEY;
+
+// Jalur Kedua (proxy): bila panel mengirim creds.proxy (website IP-locked spt agwl), semua request admin lewat proxy user
+// (curl --socks5 / --proxy) supaya IP = IP login terdaftar. Diisi di main() dari creds. null = jalur normal (fetch biasa).
+let PROXY = null;
 
 const UA =
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -68,12 +77,42 @@ function makeHeaders(cookie) {
 		Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 	};
 }
+// Satu permintaan HTTP: lewat proxy (curl) bila PROXY diset, atau fetch biasa. Mengembalikan {status, ok, text}. redirect manual.
+async function doFetch(url, headers, timeoutMs) {
+	if (!PROXY) {
+		const r = await fetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
+		return { status: r.status, ok: r.ok, text: await r.text() };
+	}
+	const dir = mkdtempSync(join(tmpdir(), "lap-"));
+	const hdrFile = join(dir, "h"), bodyFile = join(dir, "b");
+	const secs = Math.max(5, Math.round(timeoutMs / 1000));
+	const proxyArg = PROXY.scheme === "socks5" ? "--socks5-hostname" : "--proxy";
+	const proxyUrl = PROXY.scheme === "socks5" ? `${PROXY.host}:${PROXY.port}` : `http://${PROXY.host}:${PROXY.port}`;
+	const args = ["-sS", "--compressed", "--max-time", String(secs), proxyArg, proxyUrl];
+	if (PROXY.user || PROXY.pass) args.push("--proxy-user", `${PROXY.user}:${PROXY.pass}`);
+	for (const [k, v] of Object.entries(headers || {})) if (!/[\r\n]/.test(String(v))) args.push("-H", `${k}: ${v}`);
+	args.push("-D", hdrFile, "-o", bodyFile, "-w", "%{http_code}", "--url", url);
+	try {
+		const code = await new Promise((resolve, reject) =>
+			execFile("curl", args, { timeout: (secs + 5) * 1000, maxBuffer: 32 << 20 }, (e, so) => (e ? reject(new Error("curl: " + String(e.message || e).split("\n").pop())) : resolve(String(so).trim()))),
+		);
+		const status = Number(code) || 0;
+		if (status < 100) throw new Error("curl tidak mendapat status HTTP (proxy/tujuan bermasalah)");
+		let text = "";
+		try {
+			text = readFileSync(bodyFile, "utf8");
+		} catch {}
+		return { status, ok: status >= 200 && status < 300, text };
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
 async function getText(url, headers, { attempts = 4, timeoutMs = 25000 } = {}) {
 	let lastErr = null;
 	for (let attempt = 1; attempt <= attempts; attempt++) {
 		try {
-			const r = await fetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
-			const text = await r.text();
+			const r = await doFetch(url, headers, timeoutMs);
+			const text = r.text;
 			if (r.ok) return text;
 			// Sesi admin habis -> server mengalihkan ke halaman login. Pesan ini yang
 			// dibaca operator di panel, jadi jelaskan penyebabnya (bukan "HTTP 302 + URL panjang").
@@ -901,6 +940,9 @@ deadline.unref();
 	if (hm) baseUrl = hm[1];
 	const headers = makeHeaders(creds.cookieAdmin);
 	const { startDate, endDate } = params;
+	// Jalur Kedua: bila panel menandai website ini pakai proxy, semua getText di bawah otomatis lewat proxy user.
+	PROXY = creds.proxy && creds.proxy.host && creds.proxy.port ? creds.proxy : null;
+	if (PROXY) console.log(`[Jalur Kedua] request admin lewat proxy ${PROXY.scheme}://${PROXY.host}:${PROXY.port}`);
 
 	console.log(`Job ${JOB_ID}: ${baseUrl} ${startDate}..${endDate}`);
 	const data = {};
